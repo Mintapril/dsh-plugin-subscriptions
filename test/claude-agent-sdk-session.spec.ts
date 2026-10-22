@@ -118,6 +118,24 @@ class FakeCli {
     this.emit({ type: 'result', subtype: 'success', is_error: false, stop_reason: 'end_turn', usage: { input_tokens: 10, output_tokens: 5 } })
   }
 
+  /** One answer preceded by `ms` of steadily streamed thinking. */
+  async thinkThenAnswer(ms: number, text: string): Promise<void> {
+    this.event({ type: 'message_start', message: { usage: { input_tokens: 10, output_tokens: 0 } } })
+    this.event({ type: 'content_block_start', index: 0, content_block: { type: 'thinking' } })
+    const until = Date.now() + ms
+    while (Date.now() < until && !this.closed) {
+      this.event({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'hmm ' } })
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+    this.event({ type: 'content_block_stop', index: 0 })
+    this.event({ type: 'content_block_start', index: 1, content_block: { type: 'text' } })
+    this.event({ type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text } })
+    this.event({ type: 'content_block_stop', index: 1 })
+    this.event({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 5 } })
+    this.event({ type: 'message_stop' })
+    this.emit({ type: 'result', subtype: 'success', is_error: false, stop_reason: 'end_turn', usage: { input_tokens: 10, output_tokens: 5 } })
+  }
+
   /**
    * Call one harness tool over the bridge and wait for its result, emitting
    * heartbeats meanwhile, the way the CLI does for a running tool.
@@ -160,6 +178,11 @@ class FakeCli {
     }
   }
 
+  /** Whether the session closed this CLI. */
+  get isClosed(): boolean {
+    return this.closed
+  }
+
   close(): void {
     if (this.closed) return
     this.closed = true
@@ -199,7 +222,10 @@ class FakeCli {
  * A transport whose SDK is the stand-in; `script` plays the CLI's side.
  * @returns the transport, the CLIs it started, and a cleanup function.
  */
-function harness(script: (cli: FakeCli) => Promise<void>, idleTimeoutMs = 5_000): {
+function harness(
+  script: (cli: FakeCli) => Promise<void>,
+  { idleTimeoutMs = 5_000, idleCloseMs = 60_000 }: { idleTimeoutMs?: number; idleCloseMs?: number } = {},
+): {
   sdk: ClaudeSdkTransport
   clis: FakeCli[]
   failures: unknown[]
@@ -222,7 +248,7 @@ function harness(script: (cli: FakeCli) => Promise<void>, idleTimeoutMs = 5_000)
     configDir: join(dir, 'config'),
     workDir: join(dir, 'cwd'),
     idleTimeoutMs,
-    idleCloseMs: 60_000,
+    idleCloseMs,
     onWarn: () => {},
   })
   return {
@@ -344,12 +370,37 @@ test('heartbeats alone do not keep a stalled turn alive', { timeout: 10_000 }, a
     await cli.waitPrompts(1)
     // The CLI waits on something that never comes; only heartbeats flow.
     cli.heartbeats('stuck')
-  }, 1_000)
+  }, { idleTimeoutMs: 1_000 })
   try {
     const started = Date.now()
     await assert.rejects(collect(sdk.stream(request([user('hello')]), route)), { code: 'TIMEOUT' })
     assert.ok(Date.now() - started < 5_000, `timed out after ${Date.now() - started}ms`)
   } finally {
+    await dispose()
+  }
+})
+
+test('a turn that keeps streaming is not reaped as idle, however long it runs', { timeout: 10_000 }, async () => {
+  const { sdk, clis, failures, dispose } = harness(async (cli) => {
+    await cli.waitPrompts(1)
+    await cli.thinkThenAnswer(1_500, 'thought it through')
+  }, { idleCloseMs: 500 })
+  // The idle sweep runs on a 15s+ timer; drive it directly so the turn sees
+  // what a real long turn sees once it outlives the reap window.
+  const sweep = (): void => (sdk as unknown as { sweep(): void }).sweep()
+  const sweeping = setInterval(sweep, 100)
+  try {
+    const chunks = await collect(sdk.stream(request([user('think hard')]), route))
+    assert.equal(finishOf(chunks), 'stop')
+    assert.equal(textOf(chunks), 'thought it through')
+    assert.equal(clis[0]?.isClosed, false, 'the CLI survived its own turn')
+    // Once the turn is over and the window passes, the idle CLI is reaped.
+    await new Promise(resolve => setTimeout(resolve, 700))
+    sweep()
+    assert.equal(clis[0]?.isClosed, true, 'an idle CLI is still reaped')
+    assert.deepEqual(failures, [])
+  } finally {
+    clearInterval(sweeping)
     await dispose()
   }
 })

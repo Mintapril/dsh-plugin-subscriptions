@@ -1548,8 +1548,12 @@ export class ClaudeSdkSession {
       }
       const message = step.value
       // A tool heartbeat only says the CLI is waiting on the bridge; counting it
-      // as activity would keep a stuck turn alive forever.
-      if (message.type !== 'tool_progress') watchdog.pulse()
+      // as activity would keep a stuck turn alive forever. Real output also
+      // keeps the idle sweep off a turn that streams longer than its window.
+      if (message.type !== 'tool_progress') {
+        watchdog.pulse()
+        this.touch()
+      }
       if (message.type === 'stream_event') {
         if (message.parent_tool_use_id !== null && message.parent_tool_use_id !== undefined) continue
         this.partialSeen = true
