@@ -89,10 +89,11 @@ export function createSpeedLoader(
     const directories = models()
     const current = directories === undefined ? null : (await directories.directoryFor(sessionId).load()).current
     const state = await callSubscriptionsAuth<SpeedState>(connection.rpc, 'speed', {
-      sessionId, ...(current?.provider === 'codex' ? { model: current.model } : {}),
+      sessionId, ...(current === null ? {} : { model: current.model }),
     })
-    const visible = current !== null && current.provider === 'codex'
-      && state.fastModels.includes(current.model)
+    // Visible for any route whose model advertises a fast tier (Codex service
+    // tiers and Claude fast mode both land in this list).
+    const visible = current !== null && state.fastModels.includes(current.model)
     return { visible, tier: state.tier }
   }
 }

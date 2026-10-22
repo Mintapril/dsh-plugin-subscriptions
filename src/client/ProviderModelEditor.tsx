@@ -207,7 +207,7 @@ export const ProviderModelEditor = forwardRef<ProviderModelEditorHandle, Props>(
               <small>{t('modelsContextBounds', { default: model.defaultContextWindow, max: model.maxContextWindow })}</small>
             </div>}
             </div>
-            {provider === 'codex' && (model.fastTier || Object.hasOwn(draft.subagentSpeeds ?? {}, model.id)) && <div style={{ display: 'grid', gap: 6 }}>
+            {(model.fastTier || Object.hasOwn(draft.subagentSpeeds ?? {}, model.id)) && <div style={{ display: 'grid', gap: 6 }}>
               <label style={actions}>{t('modelsSubagentSpeed')}
                 <select aria-label={`${model.name} ${t('modelsSubagentSpeed')}`}
                   value={Object.hasOwn(draft.subagentSpeeds ?? {}, model.id) ? draft.subagentSpeeds![model.id] : 'standard'}

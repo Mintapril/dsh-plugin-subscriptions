@@ -140,6 +140,8 @@ test('Codex subagent speed defaults persist independently and validate model key
     for (const subagentSpeeds of [null, [], 'fast', { m: true }, { m: 'priority' }, { '': 'fast' }]) {
       assert.throws(() => validatePreferences('codex', { subagentSpeeds }), /subagent speeds/)
     }
-    assert.throws(() => validatePreferences('claude', { subagentSpeeds: { m: 'fast' } }), /only for Codex/)
+    // Claude joins Codex in supporting speed defaults; the other routes do not.
+    assert.equal(validatePreferences('claude', { subagentSpeeds: { m: 'fast' } }).subagentSpeeds!.m, 'fast')
+    assert.throws(() => validatePreferences('grok', { subagentSpeeds: { m: 'fast' } }), /only for Codex and Claude/)
   } finally { await rm(dir, { recursive: true, force: true }) }
 })

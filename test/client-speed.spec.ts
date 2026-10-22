@@ -17,12 +17,17 @@ test('Speed selector resolves a child default for the current model and rechecks
   assert.deepEqual(await load(), { visible: true, tier: 'fast' })
   current = { provider: 'codex', model: 'plain-model' }
   assert.deepEqual(await load(), { visible: false, tier: 'standard' })
+  // Claude advertises fast through its own model metadata, so the same control
+  // shows for a claude route whose model is in the host's fast list.
   current = { provider: 'claude', model: 'fast-model' }
+  assert.deepEqual(await load(), { visible: true, tier: 'fast' })
+  current = { provider: 'claude', model: 'plain-model' }
   assert.deepEqual(await load(), { visible: false, tier: 'standard' })
   assert.deepEqual(requests, [
     { sessionId: 'child', model: 'fast-model' },
     { sessionId: 'child', model: 'plain-model' },
-    { sessionId: 'child' },
+    { sessionId: 'child', model: 'fast-model' },
+    { sessionId: 'child', model: 'plain-model' },
   ])
   assert.deepEqual(await createSpeedLoader(connection, () => undefined, 'unknown')(), { visible: false, tier: 'standard' })
 })

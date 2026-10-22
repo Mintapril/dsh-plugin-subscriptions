@@ -210,6 +210,27 @@ the route **refuses turns** instead of falling back to the direct transport — 
 `claudeTransport: 'api'` to opt back in to the direct Messages API call, which does not comply with
 the subscription terms.
 
+### Speed (fast mode) on Claude
+
+The composer Speed control now covers Claude too. Fast is offered only for models the official
+CLI reports as fast-capable (`claude-opus-*` today; Sonnet, Fable and Haiku are not), which the
+transport reads once per process from the CLI's own model table. Choosing **Fast** opts the SDK
+session into fast mode and switching back to **Standard** turns it off, both without restarting
+the CLI process.
+
+Fast mode is gated by the plan, not by this plugin: Claude Code bills fast turns as **usage
+credits** (pay-as-you-go). A subscription-only account therefore keeps running standard, and the
+plugin says so once per session instead of silently ignoring the toggle:
+
+```
+claude agent sdk: fast mode is not active (preference); the account policy keeps fast mode off —
+Claude fast mode bills as usage credits (pay-as-you-go) and is not part of a subscription plan
+```
+
+`claudeFastMode: on` forces the overlay for every session (still subject to the same plan check);
+`off` pins standard; the default `auto` follows the per-session Speed control. Per-model subagent
+speed defaults work for Claude as well, stored beside Codex's in `provider-settings.json`.
+
 The SDK process is isolated: `settingSources: []` (no CLAUDE.md, hooks, skills, plugins or MCP
 config), `tools: []`, `strictMcpConfig`, `persistSession: false`, and a private `CLAUDE_CONFIG_DIR`
 under `~/.dsh/plugins/subscriptions/claude-sdk/` with `DISABLE_AUTOUPDATER=1`. Nothing is written to

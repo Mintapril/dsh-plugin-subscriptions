@@ -15,7 +15,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import './keep-alive.js'
-import { ClaudeSdkToolNames, ClaudeSdkTransport, claudeSdkEnv, resolveClaudeSdkEntry } from '../src/providers/claude-agent-sdk.js'
+import {
+  CLAUDE_SDK_FAST_REFUSAL_HINTS,
+  ClaudeSdkToolNames,
+  ClaudeSdkTransport,
+  claudeSdkEnv,
+  fastCapabilityMatches,
+  resolveClaudeSdkEntry,
+} from '../src/providers/claude-agent-sdk.js'
 import { Config } from '../src/index.js'
 
 /** One constructed transport, closed by the caller. */
@@ -196,6 +203,42 @@ test('MCP child: without a bridge it still declares the catalog and defers calls
     child.kill()
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('fast mode: the session choice wins, an explicit plugin policy overrides it', async () => {
+  const auto = transport({ fastMode: 'auto' })
+  assert.deepEqual(auto.flagSettings(), {}, 'no session choice leaves Claude Code alone')
+  assert.deepEqual(auto.flagSettings({ fast: true }), { fastMode: true })
+  assert.deepEqual(auto.flagSettings({ fast: false }), { fastMode: false })
+  await auto.close()
+
+  const forcedOff = transport({ fastMode: 'off' })
+  assert.deepEqual(forcedOff.flagSettings({ fast: true }), { fastMode: false }, 'the plugin policy wins')
+  await forcedOff.close()
+
+  const forcedOn = transport({ fastMode: 'on' })
+  assert.deepEqual(forcedOn.flagSettings({ fast: false }), { fastMode: true }, 'the plugin policy wins')
+  await forcedOn.close()
+})
+
+test('fast capability: exact ids and family aliases both match', () => {
+  const table = { exact: new Set(['opus', 'claude-opus-5-5']), aliases: new Set(['opus']) }
+  // A bare alias is not a model id, so it only widens the family.
+  assert.equal(fastCapabilityMatches(table, 'claude-opus-5-5'), true)
+  assert.equal(fastCapabilityMatches(table, 'claude-opus-5'), true)
+  assert.equal(fastCapabilityMatches(table, 'claude-sonnet-5'), false)
+  assert.equal(fastCapabilityMatches(table, 'claude-haiku-4-5-20251001'), false)
+  assert.equal(fastCapabilityMatches({ exact: new Set<string>(), aliases: new Set<string>() }, 'claude-opus-5-5'), false)
+})
+
+test('fast refusals: every documented reason explains itself', () => {
+  for (const reason of ['preference', 'extra_usage_disabled', 'out_of_credits', 'model_not_allowed',
+    'disabled_by_env', 'not_first_party', 'sdk_opt_in_required', 'cooldown', 'pending']) {
+    assert.ok((CLAUDE_SDK_FAST_REFUSAL_HINTS[reason] ?? '').length > 10, `no hint for ${reason}`)
+  }
+  // The plan-policy reason must name the pay-as-you-go rule, which is the one
+  // subscription-only accounts actually hit.
+  assert.match(CLAUDE_SDK_FAST_REFUSAL_HINTS.preference!, /usage credits/)
 })
 
 test('config: the SDK transport is the default and its knobs are validated', () => {

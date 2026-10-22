@@ -570,6 +570,12 @@ export interface ClaudeAdapterOptions {
    * diagnostic `api` opt-in).
    */
   agentSdk?: ClaudeSdkRouteStream
+  /**
+   * This session's Speed choice, read per request so a toggle applies to the
+   * next turn. Only the Agent SDK transport can honour it: the direct transport
+   * has no fast tier.
+   */
+  speedFor?: (sessionId: string | undefined, model: string) => boolean | Promise<boolean>
   /** Lifetime of the request's cache breakpoints; absent means Anthropic's five-minute default. */
   promptCacheTtl?: PromptCacheTtl
   /**
@@ -769,11 +775,21 @@ export class ClaudeAdapter extends LlmAdapter {
         catalog,
         () => this.fetchCatalog(account, signal),
       ), preferCached)
+      // Fast capability is the official CLI's model metadata, so it only exists
+      // on the Agent SDK transport; the probe is cached, these checks are cheap.
+      const agentSdk = this.options.agentSdk
+      const fast = new Set<string>()
+      if (agentSdk !== undefined) {
+        await Promise.all(models.map(async (model) => {
+          if (await agentSdk.supportsFast(model.id)) fast.add(model.id)
+        }))
+      }
       return models.map(model => ({
         provider,
         id: model.id,
         name: model.name,
         inputModalities: CLAUDE_MODALITIES,
+        ...(fast.has(model.id) ? { fastTier: true } : {}),
       }))
     } catch (error: unknown) {
       if (isDiscoveryAborted(error, signal)) throw error
@@ -808,7 +824,36 @@ export class ClaudeAdapter extends LlmAdapter {
       },
       defaultMaxTokens: claudeMaxTokens(configured, disc),
       ...(reasoning === undefined ? {} : { reasoning }),
+      ...(await this.supportsFastTier(model) ? { fastTier: true } : {}),
     }
+  }
+
+  /** Whether the official CLI marks this model fast-capable (Agent SDK transport only). */
+  async supportsFastTier(model: string): Promise<boolean> {
+    const agentSdk = this.options.agentSdk
+    return agentSdk !== undefined && await agentSdk.supportsFast(model)
+  }
+
+  /** Ids of every discovered model with a fast tier (the Speed toggle's visibility list). */
+  async fastCapableModels(): Promise<string[]> {
+    const agentSdk = this.options.agentSdk
+    if (agentSdk === undefined || !this.options.discovery) return []
+    const accounts = (await this.options.tokens.list()).map(entry => entry.key)
+    if (accounts.length === 0) return []
+    const ids: string[] = []
+    for (const account of accounts) {
+      try {
+        const catalog = await this.catalogFor(account)
+        const models = await catalog.resolve(() => this.fetchCatalog(account))
+        for (const model of models ?? []) {
+          if (ids.includes(model.id)) continue
+          if (await agentSdk.supportsFast(model.id)) ids.push(model.id)
+        }
+      } catch {
+        // Sit this account out; the toggle simply does not offer its models.
+      }
+    }
+    return ids
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
@@ -838,6 +883,8 @@ export class ClaudeAdapter extends LlmAdapter {
         ? String(options.reasoningEffort)
         : undefined
       const cacheTtl = this.options.promptCacheTtlOverride?.() ?? this.options.promptCacheTtl
+      const fast = this.options.speedFor !== undefined
+        && await this.options.speedFor(options.sessionId, options.model)
       yield* agentSdk.stream(options, {
         ...(account === undefined ? {} : { account }),
         model: options.model,
@@ -845,6 +892,7 @@ export class ClaudeAdapter extends LlmAdapter {
         maxTokens,
         ...(thinking === undefined ? {} : { thinking: claudeSdkThinking(thinking) }),
         ...(cacheTtl === undefined ? {} : { promptCacheTtl: cacheTtl }),
+        fast,
         ...(this.options.resolveAttachments === undefined
           ? {} : { resolveAttachments: this.options.resolveAttachments }),
         accessToken: async force => (await this.options.tokens.session(account, force)).accessToken,

@@ -834,18 +834,19 @@ export function apply(ctx: Context, config: Config): void {
   // without an explicit choice use their persisted model default. Every
   // request still gates Fast on the model's discovered capability.
   const speedBySession = new Map<string, SpeedTier>()
-  const selectedSpeed = (sessionId: string, model?: string): SpeedTier => {
+  const selectedSpeed = (sessionId: string, model?: string, provider: ProviderId = 'codex'): SpeedTier => {
     const explicit = speedBySession.get(sessionId)
     if (explicit !== undefined) return explicit
     // The request itself carries no subagent flag. The live registry exposes
     // durable origin metadata for spawn, fork, and resumed subagents alike.
     const agent = ctx.get('agents')?.get(sessionId as NonNullable<GenerateOptions['sessionId']>)
     if (model !== undefined && agent?.session.header.origin === 'subagent') {
-      return preferences.subagentSpeed(parseAccountModelId(model)?.model ?? model)
+      return preferences.subagentSpeed(parseAccountModelId(model)?.model ?? model, provider)
     }
     return 'standard'
   }
   let codexAdapter: CodexAdapter | undefined
+  let claudeAdapter: ClaudeAdapter | undefined
   // Dropped on every copilot auth transition so replay state (captured
   // reasoning) never survives an account switch in memory.
   let copilotAdapter: CopilotAdapter | undefined
@@ -941,7 +942,7 @@ export function apply(ctx: Context, config: Config): void {
           pool: () => poolAdapter,
           speedFor: (sessionId: string | undefined, model: string): boolean | Promise<boolean> =>
             sessionId !== undefined
-            && selectedSpeed(sessionId, model) === 'fast'
+            && selectedSpeed(sessionId, model, 'codex') === 'fast'
             && adapter.supportsFastTier(model),
         })
         codexAdapter = adapter
@@ -975,7 +976,8 @@ export function apply(ctx: Context, config: Config): void {
         if (claudeAgentSdk !== undefined) {
           ctx.effect(() => () => { void claudeAgentSdk.close() }, 'dsh-plugin-subscriptions: claude agent sdk transport')
         }
-        const adapter = new ClaudeAdapter({
+        let adapter!: ClaudeAdapter
+        adapter = new ClaudeAdapter({
           models: catalog.claude,
           streamIdleTimeoutMs,
           rateLimit,
@@ -992,7 +994,14 @@ export function apply(ctx: Context, config: Config): void {
           promptCacheTtlOverride: () => preferences.promptCacheTtl(),
           pool: () => poolAdapter,
           ...(claudeAgentSdk === undefined ? {} : { agentSdk: claudeAgentSdk }),
+          // Fast is model metadata from the official CLI and the account still
+          // has to be allowed to spend usage credits; both are checked per turn.
+          speedFor: (sessionId: string | undefined, model: string): boolean | Promise<boolean> =>
+            sessionId !== undefined
+            && selectedSpeed(sessionId, model, 'claude') === 'fast'
+            && adapter.supportsFastTier(model),
         })
+        claudeAdapter = adapter
         adapters.set('claude', adapter)
         handles.set('claude', register('claude', adapter))
         break
@@ -1212,13 +1221,25 @@ export function apply(ctx: Context, config: Config): void {
 
   const speed: SpeedController = {
     async speed(sessionId, model) {
-      const fastModels = await codexAdapter?.fastCapableModels() ?? []
+      const fastModels = [...await codexAdapter?.fastCapableModels() ?? []]
+      for (const model of await claudeAdapter?.fastCapableModels() ?? []) {
+        if (!fastModels.includes(model)) fastModels.push(model)
+      }
       const accountPreferences = preferences.get('codex').accounts
       for (const { key } of await codexTokens?.list() ?? []) {
         if (!accountPreferences || !Object.hasOwn(accountPreferences, key) || accountPreferences[key].independentEntry !== true) continue
         for (const model of [...fastModels]) {
           if (parseAccountModelId(model)) continue
           if (await codexAdapter?.supportsFastTier(model, key)) fastModels.push(accountModelId(key, model))
+        }
+      }
+      const claudeAccountPreferences = preferences.get('claude').accounts
+      for (const { key } of await claudeTokens?.list() ?? []) {
+        if (!claudeAccountPreferences || !Object.hasOwn(claudeAccountPreferences, key)
+          || claudeAccountPreferences[key].independentEntry !== true) continue
+        for (const candidate of [...fastModels]) {
+          if (parseAccountModelId(candidate)) continue
+          if (await claudeAdapter?.supportsFastTier(candidate)) fastModels.push(accountModelId(key, candidate))
         }
       }
       return {
@@ -1365,7 +1386,12 @@ export function apply(ctx: Context, config: Config): void {
         models: await withTimeout(signal => adapter.listOwnModels(provider, account.key, signal, !force), DISCOVERY_TIMEOUT_MS).catch(() => undefined),
       })))
       const tierIds = new Set((await poolAdapter?.modelsForProvider(provider).catch(() => []) ?? []).map(model => model.id))
-      const fastModels = new Set(provider === 'codex' ? await codexAdapter?.fastCapableModels() ?? [] : [])
+      const fastProvider = provider === 'codex' || provider === 'claude'
+      const fastModels = new Set(
+        provider === 'codex' ? await codexAdapter?.fastCapableModels() ?? []
+          : provider === 'claude' ? await claudeAdapter?.fastCapableModels() ?? []
+            : [],
+      )
       const rows = await Promise.all(models.map(async model => {
         const contexts: { default: number; max: number }[] = []
         if (provider === 'codex' && codexAdapter) {
@@ -1383,7 +1409,7 @@ export function apply(ctx: Context, config: Config): void {
           contextWindow: info?.context?.contextWindow,
           efforts: tierIds.has(model.id) ? [] : info?.reasoning?.efforts.map(({ id, name }) => ({ id, name })) ?? [],
           configured: defaultEffortOf(provider, model.id),
-          ...(provider === 'codex' ? { fastTier: !tierIds.has(model.id) && fastModels.has(model.id) } : {}),
+          ...(fastProvider ? { fastTier: !tierIds.has(model.id) && fastModels.has(model.id) } : {}),
           ...(contexts.length ? {
             defaultContextWindow: Math.min(...contexts.map(entry => entry.default)),
             maxContextWindow: Math.min(...contexts.map(entry => entry.max)),

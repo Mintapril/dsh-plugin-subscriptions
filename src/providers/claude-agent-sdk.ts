@@ -101,6 +101,8 @@ interface SdkResultMessage {
   api_error_status?: number | null
   errors?: readonly string[]
   num_turns?: number
+  fast_mode_state?: 'off' | 'cooldown' | 'on'
+  fast_mode_disabled_reason?: string
 }
 
 /** Startup and status frames. */
@@ -126,6 +128,16 @@ export interface ClaudeSdkQuery extends AsyncGenerator<SdkMessage, void> {
   setModel(model?: string): Promise<void>
   applyFlagSettings(settings: Record<string, unknown>): Promise<void>
   close(): void
+  /** The CLI's model table, including which models can run fast mode. */
+  supportedModels?(): Promise<readonly SdkModelRow[]>
+}
+
+/** One row of the CLI's model table. */
+interface SdkModelRow {
+  value?: string
+  resolvedModel?: string
+  displayName?: string
+  supportsFastMode?: boolean
 }
 
 /** The `query()` entry point of the SDK module. */
@@ -152,6 +164,11 @@ export interface ClaudeSdkRoute {
   maxTokens?: number
   /** Prompt-cache lifetime resolved from config and the per-model preference. */
   promptCacheTtl?: '5m' | '1h'
+  /**
+   * This session's Speed choice. `true` opts the SDK session into fast mode;
+   * `false` keeps it standard; absent leaves the plugin's own policy in charge.
+   */
+  fast?: boolean
   /** Attachment service, for images the harness resolved into the request. */
   resolveAttachments?: () => AttachmentStore | undefined
   /** Read the stored subscription token; `force` refreshes it first. */
@@ -183,6 +200,8 @@ export interface ClaudeSdkTransportOptions {
   onLog?: (message: string, detail?: unknown) => void
   /** Raw result frame hook, for hosts that want per-turn cost accounting. */
   onResult?: (key: string, message: unknown) => void
+  /** Read a subscription token for the one-time fast-capability probe. */
+  accessToken?: (force: boolean) => Promise<string>
   /** How long a harness tool result waits for the CLI to report its call. */
   toolWaitMs?: number
   /** How long a late bridge handshake is awaited before degrading. */
@@ -198,6 +217,11 @@ export interface ClaudeSdkRouteStream {
   stream(options: GenerateOptions, route: ClaudeSdkRoute): AsyncGenerator<StreamChunk>
   /** Stop every CLI process; resolves once each teardown has been requested. */
   close(): Promise<void>
+  /**
+   * Whether the official CLI marks this model fast-capable. Model metadata
+   * only: the account still needs usage credits for a fast turn to run fast.
+   */
+  supportsFast(model: string): Promise<boolean>
 }
 
 /**
@@ -214,8 +238,14 @@ export function claudeSdkUnavailable(reason: string): ClaudeSdkRouteStream {
     async close(): Promise<void> {
       // Nothing was started.
     },
+    async supportsFast(): Promise<boolean> {
+      return false
+    },
   }
 }
+
+/** One capability answer carrying no fast models (probe skipped or failed). */
+const EMPTY_FAST_TABLE: { exact: Set<string>; aliases: Set<string> } = { exact: new Set(), aliases: new Set() }
 
 /** MCP server name the harness tool set is registered under. */
 export const CLAUDE_SDK_MCP_SERVER = 'dsh'
@@ -1020,6 +1050,50 @@ interface ClaudeSdkPlan {
   softChanged: boolean
 }
 
+/**
+ * Whether one model id falls inside a capability table.
+ *
+ * The CLI lists both bare family aliases (`opus`) and concrete ids
+ * (`claude-opus-5-5`); an exact match wins, and a family alias covers every id
+ * of that family, so a dated spelling the CLI did not enumerate still counts.
+ * @param table - exact ids and family aliases the CLI marks fast-capable.
+ * @param model - the model id the harness routes to.
+ * @returns whether that model can run fast mode.
+ */
+export function fastCapabilityMatches(
+  table: { exact: ReadonlySet<string>; aliases: ReadonlySet<string> },
+  model: string,
+): boolean {
+  if (table.exact.has(model)) return true
+  for (const alias of table.aliases) {
+    if (model.startsWith(`claude-${alias}`)) return true
+  }
+  return false
+}
+
+/**
+ * What each fast-mode refusal means for the operator, in one line. The CLI's
+ * reason codes come from its own fast-mode gate; `preference` is the plan
+ * policy one, and `extra_usage_disabled`/`out_of_credits` are the credits gate.
+ */
+export const CLAUDE_SDK_FAST_REFUSAL_HINTS: Record<string, string> = {
+  preference: 'the account policy keeps fast mode off — Claude fast mode bills as usage credits (pay-as-you-go) and is not part of a subscription plan',
+  extra_usage_disabled: 'usage credits are not enabled for this account, so fast mode cannot run',
+  out_of_credits: 'usage credits are exhausted',
+  org_level_disabled: 'your organization turned fast mode off',
+  org_level_disabled_until: 'your organization limited usage credits',
+  member_level_disabled: 'usage credits are turned off for this account',
+  seat_tier_level_disabled: 'this seat plan does not include usage credits',
+  overage_not_provisioned: 'overage billing is not provisioned for this account',
+  no_limits_configured: 'no usage-credit limits are configured for this account',
+  model_not_allowed: 'this model does not support fast mode',
+  not_first_party: 'fast mode is only available on the first-party API',
+  disabled_by_env: 'fast mode is disabled in this environment',
+  sdk_opt_in_required: 'the SDK session did not opt in to fast mode',
+  cooldown: 'fast mode is cooling down after a rate limit',
+  pending: 'the account state was still loading',
+}
+
 /** One in-flight tool call the CLI is waiting on. */
 interface PendingToolCall {
   id: string
@@ -1057,6 +1131,10 @@ export class ClaudeSdkSession {
   private lastUsed = Date.now()
   private lastRateLimit: { status?: string; resetsAt?: number } | undefined
   private forceToken = false
+  /** Whether this turn asked the CLI for fast mode. */
+  private fastRequested = false
+  /** Reason already reported for this CLI process, so a refusal warns once. */
+  private fastRefusalReported: string | undefined
 
   constructor(transport: ClaudeSdkTransport, key: string) {
     this.transport = transport
@@ -1129,6 +1207,7 @@ export class ClaudeSdkSession {
         this.catalog = route.ephemeral === true ? [] : mcpCatalog(options.tools, this.toolNames)
         await this.start(plan, route)
       }
+      this.fastRequested = plan.signature.fastMode.includes('true')
       yield* this.pump(messages, plan, watchdog)
     } catch (error: unknown) {
       this.dirty = true
@@ -1154,7 +1233,8 @@ export class ClaudeSdkSession {
       thinking: route.thinking === undefined ? '' : JSON.stringify(route.thinking),
       cache: route.promptCacheTtl ?? '',
       maxTokens: route.maxTokens === undefined ? '' : String(route.maxTokens),
-      fastMode: this.transport.fastMode,
+      // The effective overlay, so a Speed switch is detected and applied live.
+      fastMode: JSON.stringify(this.transport.flagSettings({ fast: route.fast === true })),
     }
     const side = harnessSideMessages(messages)
     const sideHashes = side.map(messageDigest)
@@ -1167,7 +1247,6 @@ export class ClaudeSdkSession {
       && previous.thinking === signature.thinking
       && previous.cache === signature.cache
       && previous.maxTokens === signature.maxTokens
-      && previous.fastMode === signature.fastMode
     const appendable = this.ready
       && !this.dirty
       && route.ephemeral !== true
@@ -1175,7 +1254,9 @@ export class ClaudeSdkSession {
       && isPrefix(this.sentHashes, sideHashes)
     const softChanged = appendable
       && previous !== undefined
-      && (previous.model !== signature.model || previous.effort !== signature.effort)
+      && (previous.model !== signature.model
+        || previous.effort !== signature.effort
+        || previous.fastMode !== signature.fastMode)
     const skip = appendable ? this.sentHashes.length : 0
     return {
       mode: appendable ? 'append' : 'rebuild',
@@ -1199,8 +1280,16 @@ export class ClaudeSdkSession {
     if (previous.effort !== next.effort) {
       await query.applyFlagSettings({ effortLevel: next.effort.length > 0 ? next.effort : null })
     }
-    this.signature = { ...previous, model: next.model, effort: next.effort }
-    this.transport.log('claude agent sdk session retuned', { model: next.model, effort: next.effort })
+    if (previous.fastMode !== next.fastMode) {
+      const overlay = JSON.parse(next.fastMode) as Record<string, unknown>
+      await query.applyFlagSettings(Object.keys(overlay).length > 0 ? overlay : { fastMode: null })
+    }
+    this.signature = { ...previous, model: next.model, effort: next.effort, fastMode: next.fastMode }
+    this.transport.log('claude agent sdk session retuned', {
+      model: next.model,
+      effort: next.effort,
+      fast: next.fastMode,
+    })
   }
 
   /** Spawn a fresh CLI session for this conversation. */
@@ -1282,7 +1371,7 @@ export class ClaudeSdkSession {
       // visible; the CLI spells the same knob as a spawn flag.
       options.extraArgs = { 'thinking-display': 'summarized' }
     }
-    const flagSettings = this.transport.flagSettings()
+    const flagSettings = this.transport.flagSettings({ fast: route.fast === true })
     if (Object.keys(flagSettings).length > 0) options.settings = flagSettings
     if (route.ephemeral !== true) {
       options.mcpServers = {
@@ -1492,6 +1581,7 @@ export class ClaudeSdkSession {
       return
     }
     const result = outcome.message
+    this.reportFastRefusal(result.fast_mode_state, result.fast_mode_disabled_reason)
     if (result.is_error === true && translator.emittedBlock !== true) {
       const text = [result.subtype ?? 'request failed', ...Array.isArray(result.errors) ? result.errors : []].join(': ')
       const retryAfter = this.lastRateLimit?.status === 'rejected' && typeof this.lastRateLimit.resetsAt === 'number'
@@ -1615,6 +1705,23 @@ export class ClaudeSdkSession {
     })
   }
 
+  /**
+   * Tell the operator when a requested fast turn actually ran standard.
+   *
+   * Fast mode is plan-gated: Claude Code keeps it off unless the account has
+   * usage credits, so a subscription-only account sees `preference` and every
+   * turn stays standard. One notice per CLI process, not per turn.
+   * @param state - the fast-mode state the result frame reported.
+   * @param reason - the CLI's reason code, when it refused.
+   */
+  private reportFastRefusal(state: 'off' | 'cooldown' | 'on' | undefined, reason: string | undefined): void {
+    if (!this.fastRequested || state === 'on') return
+    const code = reason ?? (state === 'cooldown' ? 'cooldown' : 'unknown')
+    if (this.fastRefusalReported === code) return
+    this.fastRefusalReported = code
+    this.transport.warn(`claude agent sdk: fast mode is not active (${code}); ${CLAUDE_SDK_FAST_REFUSAL_HINTS[code] ?? 'the CLI did not report why'}`)
+  }
+
   /** Stop the CLI turn a caller abort interrupted, then drop the process. */
   private async abortTurn(): Promise<void> {
     for (const call of this.pendingCalls.values()) {
@@ -1678,6 +1785,8 @@ export class ClaudeSdkTransport implements ClaudeSdkRouteStream {
   private readonly sessions = new Map<string, ClaudeSdkSession>()
   private readonly sweepTimer: NodeJS.Timeout
   private sdkCache: ClaudeSdkModule | undefined
+  private fastCapability: Promise<{ exact: Set<string>; aliases: Set<string> }> | undefined
+  private fastCapabilityRetryAt = 0
 
   constructor(options: ClaudeSdkTransportOptions) {
     this.options = options
@@ -1722,14 +1831,109 @@ export class ClaudeSdkTransport implements ClaudeSdkRouteStream {
   }
 
   /**
-   * Fast-mode overlay for the CLI's flag settings layer. `auto` leaves Claude
-   * Code's own default alone.
+   * Fast-mode overlay for the CLI's flag settings layer.
+   *
+   * The plugin policy wins when it is explicit (`on`/`off`); under `auto` the
+   * session's own Speed choice decides, and a session with no choice leaves
+   * Claude Code's default alone.
+   * @param route - the request's fast choice, when it made one.
    * @returns the overlay, empty when the provider is left alone.
    */
-  flagSettings(): Record<string, unknown> {
+  flagSettings(route?: { fast?: boolean }): Record<string, unknown> {
     if (this.fastMode === 'on') return { fastMode: true }
     if (this.fastMode === 'off') return { fastMode: false }
-    return {}
+    if (route?.fast === undefined) return {}
+    return { fastMode: route.fast }
+  }
+
+  /**
+   * Fast capability as the official CLI reports it, resolved once per process.
+   *
+   * This is model metadata (`supportsFastMode`), not a promise that this
+   * account may run fast: a plan without usage credits still gets a standard
+   * turn, and the reason is logged through {@link reportFastRefusal}.
+   * @param model - the model id the harness routes to.
+   * @returns whether the CLI marks that model fast-capable.
+   */
+  async supportsFast(model: string): Promise<boolean> {
+    return fastCapabilityMatches(await this.fastCapabilityTable(), model)
+  }
+
+  /**
+   * The cached capability table. A failed probe answers "no fast models" and is
+   * retried after a cooldown, so a transient failure (an expired token, a busy
+   * spawn) does not hide the toggle for the rest of the process.
+   */
+  private fastCapabilityTable(): Promise<{ exact: Set<string>; aliases: Set<string> }> {
+    if (this.fastCapability !== undefined) return this.fastCapability
+    if (Date.now() < this.fastCapabilityRetryAt) return Promise.resolve(EMPTY_FAST_TABLE)
+    this.fastCapability = this.probeFastCapability().catch((error: unknown) => {
+      this.fastCapability = undefined
+      this.fastCapabilityRetryAt = Date.now() + 5 * 60_000
+      this.warn(`claude agent sdk: fast-mode capability probe failed (${String((error as Error)?.message ?? error)})`)
+      return EMPTY_FAST_TABLE
+    })
+    return this.fastCapability
+  }
+
+  /**
+   * Ask a throwaway CLI process for its model table. Cheap enough to run once:
+   * no tools, no MCP bridge, no transcript, and the process is closed at once.
+   */
+  private async probeFastCapability(): Promise<{ exact: Set<string>; aliases: Set<string> }> {
+    const empty = EMPTY_FAST_TABLE
+    const token = this.options.accessToken === undefined ? undefined : await this.options.accessToken(false)
+    if (token === undefined) return empty
+    const sdk = await this.sdk()
+    if (typeof sdk.query !== 'function') return empty
+    // The CLI is spawned with these as its cwd and config root; both must exist
+    // or the spawn fails with a misleading "binary failed to launch (ENOENT)".
+    await mkdir(this.dir, { recursive: true })
+    await mkdir(this.configDir, { recursive: true })
+    await mkdir(this.workDir, { recursive: true })
+    const input = new UserInputQueue()
+    const query = sdk.query({ prompt: input, options: this.capabilityOptions(token) })
+    try {
+      // The CLI spawns on the first read and answers with system/init; the
+      // control request below needs that session live.
+      await Promise.race([query.next(), new Promise(resolve => setTimeout(resolve, 20_000).unref())])
+      const rows = await query.supportedModels?.() ?? []
+      const exact = new Set<string>()
+      const aliases = new Set<string>()
+      for (const row of rows) {
+        if (row.supportsFastMode !== true) continue
+        if (typeof row.value === 'string' && row.value.length > 0) {
+          exact.add(row.value)
+          // A bare family alias ('opus') covers every id of that family.
+          if (!row.value.includes('-')) aliases.add(row.value)
+        }
+        if (typeof row.resolvedModel === 'string' && row.resolvedModel.length > 0) exact.add(row.resolvedModel)
+      }
+      this.log('claude agent sdk fast capability', { exact: [...exact], aliases: [...aliases] })
+      return { exact, aliases }
+    } finally {
+      input.close()
+      try {
+        query.close()
+      } catch {
+        // Already closed.
+      }
+    }
+  }
+
+  /** Options for the throwaway capability process: no tools, no bridge, no transcript. */
+  private capabilityOptions(accessToken: string): Record<string, unknown> {
+    return {
+      cwd: this.workDir,
+      env: claudeSdkEnv({ configDir: this.configDir, accessToken, proxyEnv: this.proxyEnv() }),
+      tools: [],
+      settingSources: [],
+      strictMcpConfig: true,
+      persistSession: false,
+      permissionMode: 'bypassPermissions',
+      allowDangerouslySkipPermissions: true,
+      promptSuggestions: false,
+    }
   }
 
   /**

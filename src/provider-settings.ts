@@ -126,7 +126,9 @@ export function validatePreferences(provider: ProviderId, input: unknown): Provi
     result.promptCacheTtl = raw.promptCacheTtl as PromptCacheTtlSetting
   }
   if (raw.subagentSpeeds !== undefined) {
-    if (provider !== 'codex') throw new Error('subagent speeds are currently supported only for Codex')
+    if (provider !== 'codex' && provider !== 'claude') {
+      throw new Error('subagent speeds are currently supported only for Codex and Claude')
+    }
     if (!raw.subagentSpeeds || typeof raw.subagentSpeeds !== 'object' || Array.isArray(raw.subagentSpeeds)) {
       throw new Error('subagent speeds must be a model-to-speed map')
     }
@@ -193,9 +195,15 @@ export class ProviderSettingsStore {
     return windows && Object.hasOwn(windows, model) ? windows[model] : undefined
   }
 
-  /** Read on every request so saved changes apply to the next subagent request. */
-  subagentSpeed(model: string): SubagentSpeedTier {
-    const speeds = this.current.providers.codex?.subagentSpeeds
+  /**
+   * Read on every request so saved changes apply to the next subagent request.
+   * @param model - that route's model id.
+   * @param provider - the route the subagent runs on; defaults to Codex, the
+   *   only provider with speed defaults when these were first stored.
+   * @returns the saved default tier, or standard when none is saved.
+   */
+  subagentSpeed(model: string, provider: ProviderId = 'codex'): SubagentSpeedTier {
+    const speeds = this.current.providers[provider]?.subagentSpeeds
     return speeds && Object.hasOwn(speeds, model) ? speeds[model] : 'standard'
   }
 

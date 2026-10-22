@@ -204,6 +204,24 @@ SDK 是可选运行时依赖:依次查 `claudeSdkEntry`、`DSH_CLAUDE_AGENT_SDK`
 `@anthropic-ai/claude-agent-sdk`、指定 `claudeSdkEntry`,或把 `claudeTransport` 设为 `'api'`
 显式退回直连(该路径不符合订阅条款)。
 
+### Claude 的速度(fast 模式)
+
+输入框的 Speed 控件现在也覆盖 Claude。只有官方 CLI 报告为 fast-capable 的模型才会出现这个开关
+(目前是 `claude-opus-*`;Sonnet / Fable / Haiku 不支持),这份能力表由传输层每个进程读一次 CLI 自己的
+模型表得到。选 **快速** 会给该 SDK 会话打开 fast,切回 **标准** 会关掉,两者都不重启 CLI 进程。
+
+fast 是**套餐侧**的限制,不是插件的:Claude Code 把 fast 请求按**用量额度(usage credits,按量)**计费。
+纯订阅账号因此仍是标准速度,插件会在该会话里提示一次,而不是让开关默默无效:
+
+```
+claude agent sdk: fast mode is not active (preference); the account policy keeps fast mode off —
+Claude fast mode bills as usage credits (pay-as-you-go) and is not part of a subscription plan
+```
+
+`claudeFastMode: on` 会强制所有会话打开(仍受同样的套餐检查);`off` 固定标准;默认 `auto` 跟随
+每个会话的 Speed 选择。按模型的子代理速度默认值也支持 Claude,和 Codex 的一起存在
+`provider-settings.json` 里。
+
 SDK 进程是隔离的:`settingSources: []`(不读 CLAUDE.md、hooks、skills、plugins、MCP 配置)、`tools: []`、
 `strictMcpConfig`、`persistSession: false`,以及 `~/.dsh/plugins/subscriptions/claude-sdk/` 下独立的
 `CLAUDE_CONFIG_DIR` 和 `DISABLE_AUTOUPDATER=1`。不会写你自己的 `~/.claude`,`projects/` 里不会有会话
