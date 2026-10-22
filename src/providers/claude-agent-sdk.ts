@@ -120,7 +120,24 @@ interface SdkRateLimitMessage {
   rate_limit_info?: { status?: string; resetsAt?: number }
 }
 
-type SdkMessage = SdkStreamEventMessage | SdkAssistantMessage | SdkResultMessage | SdkSystemMessage | SdkRateLimitMessage
+/**
+ * Progress of a running tool. For a harness tool this only means the CLI is
+ * waiting on the bridge (it sends a heartbeat every 30s), not that the turn
+ * is moving.
+ */
+interface SdkToolProgressMessage {
+  type: 'tool_progress'
+  tool_use_id?: string
+  heartbeat?: boolean
+}
+
+type SdkMessage =
+  | SdkStreamEventMessage
+  | SdkAssistantMessage
+  | SdkResultMessage
+  | SdkSystemMessage
+  | SdkRateLimitMessage
+  | SdkToolProgressMessage
 
 /** The interactive query handle returned by the SDK. */
 export interface ClaudeSdkQuery extends AsyncGenerator<SdkMessage, void> {
@@ -202,8 +219,6 @@ export interface ClaudeSdkTransportOptions {
   onResult?: (key: string, message: unknown) => void
   /** Read a subscription token for the one-time fast-capability probe. */
   accessToken?: (force: boolean) => Promise<string>
-  /** How long a harness tool result waits for the CLI to report its call. */
-  toolWaitMs?: number
   /** How long a late bridge handshake is awaited before degrading. */
   helloMs?: number
 }
@@ -288,9 +303,6 @@ export const CLAUDE_SDK_MCP_SERVER = 'dsh'
 
 /** Prefix the CLI puts in front of every MCP tool name. */
 const MCP_TOOL_PREFIX = `mcp__${CLAUDE_SDK_MCP_SERVER}__`
-
-/** Longest a tool result may wait for the CLI to report its call. */
-const DEFAULT_TOOL_WAIT_MS = 30_000
 
 /** How long the MCP child may take to reach the bridge before degrading. */
 const DEFAULT_HELLO_MS = 20_000
@@ -1155,8 +1167,12 @@ export class ClaudeSdkSession {
   private readonly pendingCalls = new Map<string, PendingToolCall>()
   /** Tool calls the last assistant turn asked for, keyed by tool-use id. */
   private expectedCalls = new Map<string, { id: string; name: string }>()
-  /** Wake-ups waiting for a tool call to arrive over the bridge. */
-  private readonly callWaiters = new Set<() => void>()
+  /**
+   * Results the harness already returned for calls the CLI has not made yet.
+   * The CLI runs harness tools one at a time, so the second call only reaches
+   * the bridge after the first is answered; it is answered from here on arrival.
+   */
+  private readonly stagedResults = new Map<string, unknown>()
   private readonly toolNames = new ClaudeSdkToolNames()
   private catalog: ClaudeSdkMcpTool[] = []
   private degraded = false
@@ -1182,14 +1198,22 @@ export class ClaudeSdkSession {
     this.lastUsed = Date.now()
   }
 
-  /** Hold the CLI's tool call until the harness supplies its result. */
-  private readonly onToolCall = (call: { toolUseId: string | null; name: string }): Promise<unknown> =>
-    new Promise((resolve) => {
-      const id = call.toolUseId ?? `unknown-${randomUUID()}`
+  /**
+   * Answer the CLI's tool call from a result the harness already returned, or
+   * hold it until the harness supplies one.
+   */
+  private readonly onToolCall = (call: { toolUseId: string | null; name: string }): Promise<unknown> => {
+    const id = call.toolUseId ?? `unknown-${randomUUID()}`
+    this.expectedCalls.delete(id)
+    if (this.stagedResults.has(id)) {
+      const result = this.stagedResults.get(id)
+      this.stagedResults.delete(id)
+      return Promise.resolve(result)
+    }
+    return new Promise((resolve) => {
       this.pendingCalls.set(id, { id, name: call.name, resolve })
-      this.expectedCalls.delete(id)
-      for (const waiter of [...this.callWaiters]) waiter()
     })
+  }
 
   /** The catalog the CLI may declare, in MCP shape. */
   private readonly toolCatalog = (): ClaudeSdkMcpTool[] => this.catalog
@@ -1453,7 +1477,7 @@ export class ClaudeSdkSession {
           isError: (message as { isError?: boolean }).isError === true,
         })
       }
-      if (results.size > 0) await this.deliverResults(results, watchdog)
+      if (results.size > 0) await this.deliverResults(results)
       for (const message of forwarded) {
         this.input?.push({
           type: 'user',
@@ -1461,15 +1485,14 @@ export class ClaudeSdkSession {
           message: { role: 'user', content: userContentBlocks(message) },
         })
       }
+      // The CLI now holds these, so the next step only forwards what follows.
+      this.sentHashes = [...plan.sideHashes]
     }
     yield* this.readRoundTrip(watchdog)
   }
 
   /** Answer the paused turn's tool calls with the harness's real results. */
-  private async deliverResults(
-    results: Map<string, { content: unknown; isError: boolean }>,
-    watchdog: ReturnType<typeof idleWatchdog>,
-  ): Promise<void> {
+  private async deliverResults(results: Map<string, { content: unknown; isError: boolean }>): Promise<void> {
     if (!this.transport.bridge.isConnected(this.key)) {
       await this.transport.bridge.waitForHello(this.key, this.transport.helloGraceMs)
     }
@@ -1495,42 +1518,18 @@ export class ClaudeSdkSession {
       })
       this.pendingCalls.clear()
       this.expectedCalls.clear()
+      this.stagedResults.clear()
       return
     }
-    await this.waitForCalls(results, watchdog.signal)
+    const noResult = { content: [{ type: 'text', text: 'the harness returned no result for this call' }], isError: true }
+    // Calls already waiting are answered now; the rest are answered as the CLI
+    // makes them. Ids the last turn never asked for are stale and dropped.
     for (const call of [...this.pendingCalls.values()]) {
-      const result = results.get(call.id)
-      call.resolve(result ?? {
-        content: [{ type: 'text', text: 'the harness returned no result for this call' }],
-        isError: true,
-      })
+      call.resolve(results.get(call.id) ?? noResult)
       this.pendingCalls.delete(call.id)
     }
+    for (const id of this.expectedCalls.keys()) this.stagedResults.set(id, results.get(id) ?? noResult)
     this.expectedCalls.clear()
-  }
-
-  /** Wait until the CLI has reported the calls it wants executed. */
-  private waitForCalls(results: Map<string, unknown>, signal: AbortSignal | undefined): Promise<void> {
-    const missing = (): string[] => [...results.keys()].filter(id => !this.pendingCalls.has(id))
-    if (missing().length === 0 || this.expectedCalls.size === 0) return Promise.resolve()
-    return new Promise<void>((resolve) => {
-      let settled = false
-      const done = (): void => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        this.callWaiters.delete(check)
-        signal?.removeEventListener('abort', done)
-        resolve()
-      }
-      const check = (): void => {
-        if (missing().length === 0) done()
-      }
-      const timer = setTimeout(done, this.transport.toolWaitMs)
-      timer.unref()
-      this.callWaiters.add(check)
-      signal?.addEventListener('abort', done, { once: true })
-    })
   }
 
   /** Read exactly one model round trip out of the session's event stream. */
@@ -1548,7 +1547,9 @@ export class ClaudeSdkSession {
         throw new LlmError('claude agent sdk ended the stream before the turn finished', 'STREAM_CLOSED')
       }
       const message = step.value
-      watchdog.pulse()
+      // A tool heartbeat only says the CLI is waiting on the bridge; counting it
+      // as activity would keep a stuck turn alive forever.
+      if (message.type !== 'tool_progress') watchdog.pulse()
       if (message.type === 'stream_event') {
         if (message.parent_tool_use_id !== null && message.parent_tool_use_id !== undefined) continue
         this.partialSeen = true
@@ -1611,7 +1612,9 @@ export class ClaudeSdkSession {
     }
     if (outcome === undefined) throw new LlmError('claude agent sdk produced no outcome', EMPTY_RESPONSE_CODE)
     if (outcome.kind === 'tool-calls') {
-      this.expectedCalls = new Map(toolCalls.map(call => [call.id, call]))
+      // The CLI can start a call while the message is still streaming; one
+      // that already reached the bridge is pending, not expected.
+      this.expectedCalls = new Map(toolCalls.filter(call => !this.pendingCalls.has(call.id)).map(call => [call.id, call]))
       yield { type: 'usage', usage: usage ?? { inputTokens: 0, outputTokens: 0 } }
       yield { type: 'finish', reason: { kind: 'tool-calls' } }
       return
@@ -1765,6 +1768,7 @@ export class ClaudeSdkSession {
     }
     this.pendingCalls.clear()
     this.expectedCalls.clear()
+    this.stagedResults.clear()
     const query = this.query
     if (query !== undefined) {
       const interrupt = Promise.resolve().then(() => query.interrupt()).catch(() => undefined)
@@ -1780,6 +1784,7 @@ export class ClaudeSdkSession {
     }
     this.pendingCalls.clear()
     this.expectedCalls.clear()
+    this.stagedResults.clear()
     const query = this.query
     this.query = undefined
     this.iterator = undefined
@@ -1849,11 +1854,6 @@ export class ClaudeSdkTransport implements ClaudeSdkRouteStream {
   /** Idle timeout of one stream read. */
   get idleTimeoutMs(): number {
     return this.options.idleTimeoutMs
-  }
-
-  /** How long a tool result waits for the CLI to report its call. */
-  get toolWaitMs(): number {
-    return this.options.toolWaitMs ?? DEFAULT_TOOL_WAIT_MS
   }
 
   /** How long a late bridge handshake is awaited before degrading. */
