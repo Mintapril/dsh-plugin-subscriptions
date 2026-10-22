@@ -18,6 +18,7 @@ import type { ClaudeSession } from '../auth/store.js'
 import type { ProviderId } from '../auth/store.js'
 import type { PoolAdapter } from './pool.js'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
+import type { ClaudeSdkRouteStream } from './claude-agent-sdk.js'
 import { hostSupportsImageOffload, IMAGE_OFFLOAD_REQUIRED, requiredImageOffloadCount, resolveImages } from '../translate/resolved.js'
 import type { TranslatableMessage } from '../translate/resolved.js'
 import {
@@ -562,6 +563,13 @@ export interface ClaudeAdapterOptions {
   defaultEffortOf?: (model: string) => string | undefined
   /** Resolves the Claude Code version to present (npm-backed); absent means the local floor. */
   resolveCliVersion?: () => Promise<string>
+  /**
+   * Compliant transport: when set, every request is served by the official
+   * Claude Agent SDK instead of this adapter posting to the Messages API with
+   * the subscription token. Absent keeps the direct transport (and its
+   * diagnostic `api` opt-in).
+   */
+  agentSdk?: ClaudeSdkRouteStream
   /** Lifetime of the request's cache breakpoints; absent means Anthropic's five-minute default. */
   promptCacheTtl?: PromptCacheTtl
   /**
@@ -818,6 +826,31 @@ export class ClaudeAdapter extends LlmAdapter {
   }
 
   private async *streamCore(options: GenerateOptions, account?: string): AsyncIterable<StreamChunk> {
+    const agentSdk = this.options.agentSdk
+    if (agentSdk !== undefined) {
+      const disc = await this.discovered(options.model)
+      const maxTokens = options.maxTokens
+        ?? claudeMaxTokens(this.options.models.find(entry => entry.id === options.model), disc)
+      // The CLI takes the thinking budget natively and the display mode as a
+      // spawn flag, so the shared parameter is split rather than forwarded.
+      const thinking = this.thinkingParam(disc?.thinkingType, maxTokens)
+      const effort = options.reasoningEffort !== undefined && disc?.reasoning !== undefined
+        ? String(options.reasoningEffort)
+        : undefined
+      const cacheTtl = this.options.promptCacheTtlOverride?.() ?? this.options.promptCacheTtl
+      yield* agentSdk.stream(options, {
+        ...(account === undefined ? {} : { account }),
+        model: options.model,
+        ...(effort === undefined ? {} : { effort }),
+        maxTokens,
+        ...(thinking === undefined ? {} : { thinking: claudeSdkThinking(thinking) }),
+        ...(cacheTtl === undefined ? {} : { promptCacheTtl: cacheTtl }),
+        ...(this.options.resolveAttachments === undefined
+          ? {} : { resolveAttachments: this.options.resolveAttachments }),
+        accessToken: async force => (await this.options.tokens.session(account, force)).accessToken,
+      })
+      return
+    }
     const watchdog = idleWatchdog(options.signal, this.options.streamIdleTimeoutMs)
     try {
       let session = await this.options.tokens.session(account)
@@ -900,4 +933,16 @@ export class ClaudeAdapter extends LlmAdapter {
       signal,
     })
   }
+}
+
+/**
+ * Narrow the shared thinking parameter onto the SDK's own shape: the CLI takes
+ * the budget itself and renders the display mode from its spawn flags.
+ * @param param - the parameter the direct transport would have sent.
+ * @returns the equivalent SDK thinking parameter.
+ */
+function claudeSdkThinking(param: Record<string, unknown>): { type: 'adaptive' } | { type: 'enabled'; budgetTokens?: number } {
+  if (param.type === 'adaptive') return { type: 'adaptive' }
+  const budget = typeof param.budget_tokens === 'number' ? param.budget_tokens : undefined
+  return { type: 'enabled', ...(budget === undefined ? {} : { budgetTokens: budget }) }
 }

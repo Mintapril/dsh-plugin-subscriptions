@@ -27,7 +27,10 @@ import { OAuthFlowManager, type OAuthAttempt } from './auth/oauth-flow.js'
 import { DeviceFlowManager, type DeviceAttempt } from './auth/device-flow.js'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { readClaudeCodeCredentials, refreshClaudeSynced } from './auth/claude-code-creds.js'
+import { ClaudeSdkTransport, claudeSdkUnavailable, resolveClaudeSdkEntry } from './providers/claude-agent-sdk.js'
+import type { ClaudeSdkRouteStream } from './providers/claude-agent-sdk.js'
 import { ResetRedemption } from './providers/reset-redemption.js'
 import { BadRequest, registerAuthRpc } from './auth/rpc.js'
 import type {
@@ -173,6 +176,23 @@ export interface Config {
    * compaction and session-title requests always stay on five minutes.
    */
   claudePromptCacheTtl?: PromptCacheTtl
+  /**
+   * How the claude subscription route performs inference. `'agent-sdk'`
+   * (default) hands every request to the official Claude Agent SDK, which is
+   * the only client the subscription terms allow to spend the OAuth token;
+   * `'api'` keeps the direct Messages API call and is a diagnostic opt-in that
+   * does not comply with those terms.
+   */
+  claudeTransport?: 'agent-sdk' | 'api'
+  /** Explicit `@anthropic-ai/claude-agent-sdk` entry path; absent means discover one. */
+  claudeSdkEntry?: string
+  /** How long an idle Agent SDK CLI process is kept for reuse, in milliseconds. */
+  claudeIdleCloseMs?: number
+  /**
+   * Fast-mode policy for the Agent SDK transport: `'auto'` leaves Claude
+   * Code's own setting alone, `'on'`/`'off'` force it for these sessions.
+   */
+  claudeFastMode?: 'auto' | 'on' | 'off'
   /** Whether and how long a route waits out a closed rate-limit window. */
   rateLimit?: RateLimitConfig
   /** Advisory model catalogs overriding the built-in defaults, per provider. */
@@ -230,6 +250,10 @@ export const Config: z<Config> = z.object({
   codexClientVersion: z.string(),
   streamIdleTimeoutMs: z.number().min(1).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
   claudePromptCacheTtl: z.union(['5m', '1h']).default(DEFAULT_PROMPT_CACHE_TTL),
+  claudeTransport: z.union(['agent-sdk', 'api']).default('agent-sdk'),
+  claudeSdkEntry: z.string(),
+  claudeIdleCloseMs: z.number().step(1).min(1),
+  claudeFastMode: z.union(['auto', 'on', 'off']).default('auto'),
   rateLimit: z.object({
     wait: z.boolean().default(true),
     maxWaitMs: z.number().min(1).default(DEFAULT_RATE_LIMIT_MAX_WAIT_MS),
@@ -726,6 +750,19 @@ export function apply(ctx: Context, config: Config): void {
   if (claudePromptCacheTtl !== '5m' && claudePromptCacheTtl !== '1h') {
     throw new Error(`${name}: claudePromptCacheTtl must be '5m' or '1h'`)
   }
+  const claudeTransport = config.claudeTransport ?? 'agent-sdk'
+  if (claudeTransport !== 'agent-sdk' && claudeTransport !== 'api') {
+    throw new Error(`${name}: claudeTransport must be 'agent-sdk' or 'api'`)
+  }
+  const claudeSdkEntry = config.claudeSdkEntry
+  const claudeIdleCloseMs = config.claudeIdleCloseMs ?? 600_000
+  if (!Number.isFinite(claudeIdleCloseMs) || claudeIdleCloseMs <= 0) {
+    throw new Error(`${name}: claudeIdleCloseMs must be a positive finite number`)
+  }
+  const claudeFastMode = config.claudeFastMode ?? 'auto'
+  if (claudeFastMode !== 'auto' && claudeFastMode !== 'on' && claudeFastMode !== 'off') {
+    throw new Error(`${name}: claudeFastMode must be 'auto', 'on' or 'off'`)
+  }
   const rateLimit = resolveRateLimitWait(config.rateLimit, `${name}: rateLimit`)
   const catalog = resolveCatalog(config.models)
   // A non-empty configured catalog is an explicit override: it wins over live
@@ -821,6 +858,41 @@ export function apply(ctx: Context, config: Config): void {
     memberAdapters.set(provider, route.poolMember())
     return ctx.llm.registerAdapter([provider], route)
   }
+  /**
+   * Build the compliant claude transport, or the refusing stand-in when no SDK
+   * installation can be found.
+   * @returns the transport seam handed to the claude adapter.
+   */
+  const resolveAgentSdkTransport = (): ClaudeSdkRouteStream => {
+    const entry = resolveClaudeSdkEntry(claudeSdkEntry)
+    if (entry === undefined) {
+      onWarn(
+        'the Claude Agent SDK is not installed, so the claude subscription route is refused instead of '
+        + 'falling back to the direct API transport, which does not comply with the subscription terms; '
+        + 'install @anthropic-ai/claude-agent-sdk, set claudeSdkEntry, or set claudeTransport: \'api\' to opt in',
+      )
+      return claudeSdkUnavailable(
+        'the Claude Agent SDK is not installed: install @anthropic-ai/claude-agent-sdk, set claudeSdkEntry, '
+        + 'or set claudeTransport: \'api\'',
+      )
+    }
+    return new ClaudeSdkTransport({
+      sdkEntry: entry,
+      dir: dshHomePath('plugins', 'subscriptions', 'claude-sdk'),
+      configDir: dshHomePath('plugins', 'subscriptions', 'claude-sdk', 'config'),
+      workDir: dshHomePath('plugins', 'subscriptions', 'claude-sdk', 'work'),
+      idleTimeoutMs: streamIdleTimeoutMs,
+      idleCloseMs: claudeIdleCloseMs,
+      fastMode: claudeFastMode,
+      proxyPath: dshHomePath('plugins', 'subscriptions', 'proxy.json'),
+      onWarn,
+      onLog: (message, detail) => {
+        ctx.logger.debug(`dsh-plugin-subscriptions: ${message}`, detail)
+      },
+    })
+  }
+
+
   for (const provider of providers) {
     switch (provider) {
       case 'codex': {
@@ -896,6 +968,13 @@ export function apply(ctx: Context, config: Config): void {
         accountTokens.set('claude', tokens as AccountTokenManager<StoredSession>)
         usageFetchers.claude = async (account, signal) =>
           fetchClaudeUsage(await tokens.session(account), proxiedFetch, signal, () => claudeVersion.resolve())
+        // The Agent SDK transport is built before the adapter so a missing
+        // installation is reported once at startup, and the route refuses turns
+        // instead of quietly reverting to the non-compliant direct transport.
+        const claudeAgentSdk = claudeTransport === 'agent-sdk' ? resolveAgentSdkTransport() : undefined
+        if (claudeAgentSdk !== undefined) {
+          ctx.effect(() => () => { void claudeAgentSdk.close() }, 'dsh-plugin-subscriptions: claude agent sdk transport')
+        }
         const adapter = new ClaudeAdapter({
           models: catalog.claude,
           streamIdleTimeoutMs,
@@ -912,6 +991,7 @@ export function apply(ctx: Context, config: Config): void {
           promptCacheTtl: claudePromptCacheTtl,
           promptCacheTtlOverride: () => preferences.promptCacheTtl(),
           pool: () => poolAdapter,
+          ...(claudeAgentSdk === undefined ? {} : { agentSdk: claudeAgentSdk }),
         })
         adapters.set('claude', adapter)
         handles.set('claude', register('claude', adapter))

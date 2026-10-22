@@ -443,6 +443,16 @@ export class AnthropicStreamTranslator {
    * @param event - the parsed event object.
    * @returns the StreamChunks this event produced (possibly none).
    */
+  /** Whether any content block was opened during this turn. */
+  get emittedBlock(): boolean {
+    return this.sawAnyBlock
+  }
+
+  /** The stop reason the last `message_delta` reported. */
+  get finishReason(): 'stop' | 'tool-calls' | 'max-tokens' {
+    return this.stopReason
+  }
+
   push(event: AnthropicStreamEvent): StreamChunk[] {
     if (this.terminated) return []
     const chunks: StreamChunk[] = []
