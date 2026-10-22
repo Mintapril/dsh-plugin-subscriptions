@@ -834,6 +834,15 @@ export class ClaudeAdapter extends LlmAdapter {
     return agentSdk !== undefined && await agentSdk.supportsFast(model)
   }
 
+  /**
+   * Forget the cached fast-capability answer so the next read asks the CLI.
+   * The model list's refresh calls this: the SDK may have just been installed,
+   * and a stale "no fast models" would keep the Speed toggle hidden.
+   */
+  refreshFastCapability(): void {
+    this.options.agentSdk?.invalidateFast?.()
+  }
+
   /** Ids of every discovered model with a fast tier (the Speed toggle's visibility list). */
   async fastCapableModels(): Promise<string[]> {
     const agentSdk = this.options.agentSdk

@@ -5,7 +5,8 @@ import type { ProviderPreferences, SubagentSpeedTier, SubscriptionTool } from '.
 import type { SubscriptionProvider } from './SubscriptionsSection.js'
 import { callSubscriptionsAuth } from './subscriptions-rpc.js'
 import type { AccountCatalogRow } from './account-preferences.js'
-import { modelEditorState, savedModelIds } from './model-filter.js'
+import { mergeSeeded, modelEditorState, refreshOutcome, savedModelIds } from './model-filter.js'
+import type { RefreshOutcome } from './model-filter.js'
 import type { SubscriptionsKey } from './locales.js'
 
 interface ModelRow {
@@ -72,15 +73,20 @@ export const ProviderModelEditor = forwardRef<ProviderModelEditorHandle, Props>(
   const [busy, setBusy] = useState(false)
   const [dirty, setDirty] = useState(false)
   const [error, setError] = useState('')
+  /** What the last forced re-fetch answered, printed next to the Refresh button. */
+  const [refreshed, setRefreshed] = useState<(RefreshOutcome & { keptEdits: boolean })>()
   const generation = useRef(0)
   useEffect(() => () => { generation.current++ }, [])
   useEffect(() => { onDirtyChange?.(dirty) }, [dirty])
 
+  const seededEfforts = (data: Catalog) => Object.fromEntries(data.models.map(model => [model.id, model.configured ?? '']))
+  const seededContexts = (data: Catalog) =>
+    Object.fromEntries(Object.entries(data.settings.contextWindows ?? {}).map(([id, value]) => [id, String(value)]))
   function reset(data: Catalog) {
     setCatalog(data)
     setDraft(data.settings)
-    setEfforts(Object.fromEntries(data.models.map(model => [model.id, model.configured ?? ''])))
-    setContexts(Object.fromEntries(Object.entries(data.settings.contextWindows ?? {}).map(([id, value]) => [id, String(value)])))
+    setEfforts(seededEfforts(data))
+    setContexts(seededContexts(data))
     setDirty(false)
   }
   async function load(force = false) {
@@ -89,9 +95,32 @@ export const ProviderModelEditor = forwardRef<ProviderModelEditorHandle, Props>(
     setError('')
     try {
       const data = await callSubscriptionsAuth<Catalog>(rpc, 'providerSettings', { provider, force })
-      if (generation.current === request) reset(data)
+      if (generation.current !== request) return
+      if (!force) {
+        setRefreshed(undefined)
+        reset(data)
+        return
+      }
+      // A forced re-fetch asks the provider again for its catalog. It runs
+      // while the draft is dirty, so it publishes the answer and keeps every
+      // pending edit instead of resetting the editor under the user.
+      const outcome = refreshOutcome(catalog?.models ?? [], data.models)
+      setRefreshed({ ...outcome, keptEdits: dirty })
+      if (!dirty) {
+        reset(data)
+        return
+      }
+      // Only the catalog (and the per-model values the answer supplies) move;
+      // an id the editor already knows keeps whatever the user set for it.
+      setCatalog(data)
+      setEfforts(current => mergeSeeded(current, seededEfforts(data)))
+      setContexts(current => mergeSeeded(current, seededContexts(data)))
     } catch (error) {
-      if (generation.current === request) setError(String(error instanceof Error ? error.message : error))
+      if (generation.current !== request) return
+      // Drop the last answer's counts: they would read as "this refresh
+      // reported N models" next to the failure message.
+      setRefreshed(undefined)
+      setError(String(error instanceof Error ? error.message : error))
     } finally {
       if (generation.current === request) setBusy(false)
     }
@@ -149,8 +178,17 @@ export const ProviderModelEditor = forwardRef<ProviderModelEditorHandle, Props>(
       <p className="dsh-subscription-hint">{t('modelsHint')}</p>
       {error && <p role="alert">{error}</p>}
       <div style={actions}>
-        <button type="button" className="dsh-subscription-quiet" disabled={busy || disabled || dirty} onClick={() => { void load(true) }}>{t('usageRefresh')}</button>
+        {/* Never disabled by `dirty`: refreshing keeps the draft, so fetching
+            the current model list must not require discarding edits first. */}
+        <button type="button" className="dsh-subscription-quiet" disabled={busy || disabled} onClick={() => { void load(true) }}>{t('usageRefresh')}</button>
         {busy && <span role="status">{t('modelDefaultsLoading')}</span>}
+        {!busy && refreshed !== undefined && <span role="status" className="dsh-subscription-hint">
+          {[
+            t('modelsRefreshed', { count: refreshed.total }),
+            refreshed.added.length > 0 ? t('modelsRefreshedAdded', { added: refreshed.added.length }) : '',
+            refreshed.keptEdits ? t('modelsRefreshedKept') : '',
+          ].filter(Boolean).join(' · ')}
+        </span>}
       </div>
       {catalog && <fieldset disabled={busy || disabled} style={{ border: 0, padding: 0, margin: 0, minWidth: 0, display: 'grid', gap: 12 }}>
         <label><input type="checkbox" checked={draft.visibleModels === undefined} onChange={event => {

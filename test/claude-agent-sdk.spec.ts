@@ -231,6 +231,47 @@ test('fast capability: exact ids and family aliases both match', () => {
   assert.equal(fastCapabilityMatches({ exact: new Set<string>(), aliases: new Set<string>() }, 'claude-opus-5-5'), false)
 })
 
+test('fast capability: a user-driven refresh re-probes instead of trusting the cache', async () => {
+  // A fake SDK module answers from a file, so one probe can be followed by a
+  // different answer without touching a real installation.
+  const dir = mkdtempSync(join(tmpdir(), 'claude-sdk-probe-'))
+  const fixture = join(dir, 'rows.json')
+  const entry = join(dir, 'fake-sdk.mjs')
+  writeFileSync(entry, [
+    "import { readFileSync } from 'node:fs'",
+    'export function query() {',
+    '  globalThis.__dshFastProbes = (globalThis.__dshFastProbes ?? 0) + 1',
+    '  return {',
+    "    next: async () => ({ done: false, value: { type: 'system', subtype: 'init' } }),",
+    '    supportedModels: async () => JSON.parse(readFileSync(process.env.DSH_FAST_FIXTURE, "utf8")),',
+    '    close: () => {},',
+    '  }',
+    '}',
+  ].join('\n'))
+  const previousFixture = process.env.DSH_FAST_FIXTURE
+  const previousProbes = (globalThis as { __dshFastProbes?: number }).__dshFastProbes
+  process.env.DSH_FAST_FIXTURE = fixture
+  ;(globalThis as { __dshFastProbes?: number }).__dshFastProbes = 0
+  const sdk = transport({ sdkEntry: entry, accessToken: async () => 'token', onWarn: () => {} })
+  try {
+    writeFileSync(fixture, JSON.stringify([{ value: 'opus', supportsFastMode: true }]))
+    assert.equal(await sdk.supportsFast('claude-opus-5-5'), true)
+    // The CLI's answer changes (a new SDK, a different plan): the cached table
+    // still answers, which is exactly why the refresh has to drop it.
+    writeFileSync(fixture, JSON.stringify([{ value: 'opus', supportsFastMode: false }]))
+    assert.equal(await sdk.supportsFast('claude-opus-5-5'), true)
+    sdk.invalidateFast()
+    assert.equal(await sdk.supportsFast('claude-opus-5-5'), false)
+    assert.equal((globalThis as { __dshFastProbes?: number }).__dshFastProbes, 2, 'the second answer came from a second probe')
+  } finally {
+    await sdk.close()
+    if (previousFixture === undefined) delete process.env.DSH_FAST_FIXTURE
+    else process.env.DSH_FAST_FIXTURE = previousFixture
+    ;(globalThis as { __dshFastProbes?: number }).__dshFastProbes = previousProbes ?? 0
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('fast refusals: every documented reason explains itself', () => {
   for (const reason of ['preference', 'extra_usage_disabled', 'out_of_credits', 'model_not_allowed',
     'disabled_by_env', 'not_first_party', 'sdk_opt_in_required', 'cooldown', 'pending']) {

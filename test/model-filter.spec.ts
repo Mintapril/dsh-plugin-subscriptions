@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { modelEditorNotice, modelEditorState, modelListState, savedModelIds } from '../src/client/model-filter.js'
+import { mergeSeeded, modelEditorNotice, modelEditorState, modelListState, refreshOutcome, savedModelIds } from '../src/client/model-filter.js'
 import { en, zh } from '../src/client/locales.js'
 
 test('a provider without rows reports provider-empty, not an empty filter result', () => {
@@ -99,4 +99,26 @@ test('every notice has copy in both dictionaries, and the Chinese one is Chinese
   }
   assert.match(en.modelDefaultsNoAccount, /account/i)
   assert.match(en.modelDefaultsDiscoveryFailed, /refresh/i)
+})
+
+test('a refresh reports what it actually fetched, so the button proves it worked', () => {
+  // Same answer twice: nothing new, but the count is still printed.
+  assert.deepEqual(refreshOutcome([{ id: 'a' }, { id: 'b' }], [{ id: 'a' }, { id: 'b' }]), { total: 2, added: [] })
+  // A model the provider started advertising is named.
+  assert.deepEqual(refreshOutcome([{ id: 'a' }], [{ id: 'a' }, { id: 'b' }]), { total: 2, added: ['b'] })
+  // A first load has no previous catalog to compare against.
+  assert.deepEqual(refreshOutcome([], [{ id: 'a' }]), { total: 1, added: ['a'] })
+  // An empty answer (discovery failed and fell back) is reported as zero, not as a no-op.
+  assert.deepEqual(refreshOutcome([{ id: 'a' }], []), { total: 0, added: [] })
+})
+
+test('a refresh keeps every pending per-model edit and adopts new models', () => {
+  // Refresh is clickable while the draft is dirty, so typed values must survive it.
+  assert.deepEqual(
+    mergeSeeded({ a: 'typed' }, { a: 'saved', b: 'saved' }),
+    { a: 'typed', b: 'saved' },
+    "an id the editor already had keeps the typed text",
+  )
+  assert.deepEqual(mergeSeeded({}, { a: '' }), { a: '' })
+  assert.deepEqual(mergeSeeded({ gone: '1' }, {}), { gone: '1' }, 'a vanished id as the user saw it is not dropped')
 })

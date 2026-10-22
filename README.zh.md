@@ -84,7 +84,21 @@ refresh token 不受影响。
 没有对应的：`temperature` 与 `stop`（CLI 不暴露）；每轮 `total_cost_usd`（可通过 `onResult` 钩子拿到）。
 模型目录与用量徽标仍直连 Anthropic 的**元数据**接口（不推理）；把 `models.claude` 写进配置即可跳过目录发现。
 
-### 4. 新增 / 修改的文件
+### 4. 设置里可以手动刷新模型列表
+
+账号管理弹窗里的模型列表（按模型的显示名、可见性、默认推理档、上下文、工具）现在可以随时重新向 provider 取一次目录：
+
+- **草稿有未保存改动时「刷新」仍然可点。** 以前只要有改动它就被禁用，而「能发现新模型」的恰恰只有这个按钮，
+  结果就是改模型名的中途反而完全没法刷新。
+- **刷新不会吞掉未保存的改动。** 目录用新答案替换，草稿里的显示名、可见性、推理档、上下文都保留；
+  provider 新公布的模型会作为新行出现。显式勾选过的可见性列表仍不会自动勾上这些新模型，
+  「自动显示全部模型」依旧表示「包含以后新增的模型」。
+- **会回报结果**，例如 `已获取 13 个模型 · 新增 2 个 · 未保存的修改已保留`，
+  这样「刷新了没变化」和「刷新根本没生效」不会混在一起。目录发现失败时仍回退到内置目录，并把账号行标为不可用。
+- Claude 上刷新还会丢掉 fast 能力的缓存、重新问一次 CLI，
+  所以刚装好 SDK 或套餐变化会立刻反映到 Speed 开关，而不是等五分钟的失败冷却。
+
+### 5. 新增 / 修改的文件
 
 | 路径 | 内容 |
 | --- | --- |
@@ -94,13 +108,14 @@ refresh token 不受影响。
 | `src/index.ts` | 配置项、传输构造与回收、speed 控制器、模型列表 `fastTier` |
 | `src/provider-settings.ts` | 按 provider 存储子代理速度默认值 |
 | `src/translate/anthropic.ts` | 流翻译器上两个只读访问器 |
-| `src/client/{SpeedSelect,ProviderModelEditor}.tsx`、`locales.ts` | Speed 控件不再限定 Codex |
+| `src/client/{SpeedSelect,ProviderModelEditor}.tsx`、`model-filter.ts`、`locales.ts` | Speed 控件不再限定 Codex；模型列表的「刷新」保留草稿并回报结果 |
 | `test/claude-agent-sdk.spec.ts` | 新增——env 映射、工具名、fast 策略/匹配/原因、MCP 子进程、配置 |
+| `test/claude-model-refresh.spec.ts` | 新增——强制刷新会重新取目录；失败一次不会污染缓存 |
 
-`pnpm test` 共 644 个用例，含上面 11 个。需要真实凭据的行为（工具边界、结果回灌、缓存 TTL、输出上限、
+`pnpm test` 共 649 个用例，含上面 14 个。需要真实凭据的行为（工具边界、结果回灌、缓存 TTL、输出上限、
 effort 热切换、中断恢复、fast 拒绝、`~/.claude` 隔离）在仓库外验证，脚本在同级 `work/` 目录。
 
-### 5. 配置（只列新增项）
+### 6. 配置（只列新增项）
 
 ```yaml
 - id: llm-subscriptions

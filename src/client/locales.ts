@@ -49,6 +49,9 @@ export const en = {
   modelsSearch: "X search",
   modelsWebSearch: "Web search",
   modelsSave: "Save changes",
+  modelsRefreshed: "Fetched {count} model(s)",
+  modelsRefreshedAdded: "{added} new",
+  modelsRefreshedKept: "unsaved edits kept",
   modelsUnavailable: "Currently unavailable",
 
   nav: 'Subscriptions',
@@ -239,6 +242,9 @@ export const zh = {
   modelsSearch: "X 搜索",
   modelsWebSearch: "网页搜索",
   modelsSave: "保存更改",
+  modelsRefreshed: "已获取 {count} 个模型",
+  modelsRefreshedAdded: "新增 {added} 个",
+  modelsRefreshedKept: "未保存的修改已保留",
   modelsUnavailable: "当前不可用",
 
   nav: '订阅',

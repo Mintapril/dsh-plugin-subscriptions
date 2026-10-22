@@ -94,7 +94,26 @@ Not carried: `temperature` and `stop` (the CLI exposes neither) and per-turn `to
 through the `onResult` hook). Model discovery and the usage badge still call Anthropic's metadata endpoints
 directly — metadata only, no inference; set `models.claude` in the config to skip discovery.
 
-### 4. Files added / changed
+### 4. Model list refresh in Settings
+
+The model list in the account manager (per-model display names, visibility, default effort, context,
+tools) can now re-read the provider's catalog on demand:
+
+- **Refresh stays clickable while the draft is dirty.** It used to be disabled until every edit was saved,
+  which put the one control that can reveal a newly available model out of reach exactly when someone was
+  halfway through renaming models.
+- **Unsaved edits survive the refresh.** The answer replaces the catalog; pending display names, visibility,
+  effort and context values stay in the draft, and a model the provider just started advertising appears as
+  a new row. An explicit visibility list still keeps new models unchecked; *Automatically show all models*
+  keeps meaning "including models added later".
+- **The result is reported**, e.g. `Fetched 13 model(s) · 2 new · unsaved edits kept`, so a refresh that
+  changed nothing cannot be mistaken for a dead button. A discovery failure still falls back to the built-in
+  catalog and marks the account row as unavailable.
+- On Claude the refresh also drops the cached fast-capability answer and asks the CLI again, so a freshly
+  installed SDK or a plan change reaches the Speed control immediately instead of after the five-minute
+  failure cooldown.
+
+### 5. Files added / changed
 
 | Path | Change |
 | --- | --- |
@@ -104,14 +123,15 @@ directly — metadata only, no inference; set `models.claude` in the config to s
 | `src/index.ts` | config keys, transport construction + disposal, speed controller, model-list `fastTier` |
 | `src/provider-settings.ts` | subagent speed defaults per provider |
 | `src/translate/anthropic.ts` | two read-only accessors on the stream translator |
-| `src/client/{SpeedSelect,ProviderModelEditor}.tsx`, `locales.ts` | Speed control is provider-agnostic |
+| `src/client/{SpeedSelect,ProviderModelEditor}.tsx`, `model-filter.ts`, `locales.ts` | Speed control is provider-agnostic; the model list's Refresh keeps the draft and reports what it fetched |
 | `test/claude-agent-sdk.spec.ts` | new — env mapping, tool names, fast policy/matching/reasons, MCP child, config |
+| `test/claude-model-refresh.spec.ts` | new — a forced refresh re-reads the catalog; a failed one does not poison it |
 
-`pnpm test` runs 644 specs, including those 11. Behaviour that needs a real credential (tool boundary,
+`pnpm test` runs 649 specs, including those 14. Behaviour that needs a real credential (tool boundary,
 result hand-back, cache TTL, output cap, effort retune, interrupt recovery, fast refusal, `~/.claude`
 isolation) is verified out of tree and reproducible from the sibling `work/` folder.
 
-### 5. Config (new keys only)
+### 6. Config (new keys only)
 
 ```yaml
 - id: llm-subscriptions

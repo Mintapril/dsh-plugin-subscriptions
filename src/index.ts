@@ -1373,7 +1373,13 @@ export function apply(ctx: Context, config: Config): void {
       if (!adapter) throw new BadRequest(`provider ${provider} is not configured`)
       if (force) {
         if (provider === 'codex') codexVersion.invalidate()
-        if (provider === 'claude') claudeVersion.invalidate()
+        if (provider === 'claude') {
+          claudeVersion.invalidate()
+          // The refresh also re-asks the CLI which models support fast, so a
+          // newly installed SDK or a changed plan is reflected immediately
+          // instead of after the capability probe's failure cooldown.
+          claudeAdapter?.refreshFastCapability()
+        }
         adapter.clearAccountCatalog()
         poolAdapter?.invalidate()
         handles.get(provider)?.replace([provider])

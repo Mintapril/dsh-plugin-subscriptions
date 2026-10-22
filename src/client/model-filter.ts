@@ -52,6 +52,52 @@ export function modelEditorNotice(accounts: readonly AccountCatalogRow[]): Model
   return accounts.every((account) => account.unavailable === true) ? 'discoveryFailed' : 'noModels'
 }
 
+/** What one forced re-fetch changed, for the editor's status line. */
+export interface RefreshOutcome {
+  /** Models the provider reports after the refresh (the editor adds saved-only rows). */
+  total: number
+  /** Ids this answer adds to the catalog the editor was showing. */
+  added: string[]
+}
+
+/**
+ * Diff one refresh answer against the catalog on screen.
+ *
+ * Refresh used to be silently ineffective: it returned the same list, showed nothing and
+ * looked like a dead button. The counts here are what the editor prints back, so the user
+ * can tell "13 models, 2 of them new" from "still the built-in 5 because discovery failed".
+ * @param previous - ids the editor was showing before the refresh.
+ * @param next - rows the provider just answered with.
+ * @returns the row count and the ids that are new to this editor session.
+ */
+export function refreshOutcome(
+  previous: readonly { id: string }[],
+  next: readonly { id: string }[],
+): RefreshOutcome {
+  const known = new Set(previous.map((model) => model.id))
+  return {
+    total: next.length,
+    added: next.flatMap((model) => (known.has(model.id) ? [] : [model.id])),
+  }
+}
+
+/**
+ * Re-seed one per-model text map after a refresh without losing pending edits.
+ *
+ * Refresh stays enabled while the draft is dirty, so it must not drop what the user typed:
+ * an id already present keeps its current text (edited or not), and a newly discovered id
+ * takes the value the fresh catalog reports.
+ * @param current - the editor's state before the refresh.
+ * @param seeded - the fresh catalog's values (model id → text).
+ * @returns a map holding every key of both, current values winning.
+ */
+export function mergeSeeded(
+  current: Readonly<Record<string, string>>,
+  seeded: Readonly<Record<string, string>>,
+): Record<string, string> {
+  return { ...seeded, ...current }
+}
+
 /** Everything the component needs to decide between rows and one honest notice. */
 export interface ModelEditorState {
   listState: ModelListState

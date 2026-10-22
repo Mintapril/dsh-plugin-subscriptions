@@ -188,6 +188,23 @@ try {
   await editor.getByRole('textbox', { name: 'Filter models' }).fill('absent-model')
   await editor.getByText('No model matches “absent-model”.', { exact: true }).waitFor()
   await close()
+  // Refresh is the only way back to the provider's real catalog, so it must stay
+  // clickable while the draft is dirty and must keep what the user typed.
+  await page.evaluate(() => {
+    window.models = [{ id: 'alpha', name: 'Alpha' }, { id: 'beta', name: 'Beta' }]
+  })
+  await open()
+  await page.getByLabel('Alpha Model display name', { exact: true }).fill('Pending name')
+  // The provider answers with one more model than the editor is showing.
+  await page.evaluate(() => { window.models = [...window.models, { id: 'gamma', name: 'Gamma' }] })
+  const refreshButton = editor.getByRole('button', { name: 'Refresh', exact: true })
+  assert.equal(await refreshButton.isEnabled(), true, 'Refresh stays available with unsaved edits')
+  await refreshButton.click()
+  await editor.getByText('Fetched 3 model(s) · 1 new · unsaved edits kept', { exact: true }).waitFor()
+  assert.equal(await page.getByLabel('Alpha Model display name', { exact: true }).inputValue(), 'Pending name')
+  assert.equal(await editor.getByLabel('Gamma Model display name', { exact: true }).count(), 1,
+    'a model the refresh discovered is listed without saving first')
+  await close()
   await page.evaluate(settings => {
     delete window.models; delete window.accounts; delete window.provider; window.settings = settings
   }, settingsBeforeEmpty)

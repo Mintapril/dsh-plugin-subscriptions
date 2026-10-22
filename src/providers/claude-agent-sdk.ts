@@ -222,6 +222,12 @@ export interface ClaudeSdkRouteStream {
    * only: the account still needs usage credits for a fast turn to run fast.
    */
   supportsFast(model: string): Promise<boolean>
+  /**
+   * Drop any cached capability answer so the next {@link supportsFast} asks the
+   * CLI again (the Settings model list's refresh calls this). Optional: an
+   * implementation without a cache simply omits it.
+   */
+  invalidateFast?(): void
 }
 
 /**
@@ -1857,6 +1863,18 @@ export class ClaudeSdkTransport implements ClaudeSdkRouteStream {
    */
   async supportsFast(model: string): Promise<boolean> {
     return fastCapabilityMatches(await this.fastCapabilityTable(), model)
+  }
+
+  /**
+   * Drop the cached capability table so the next read asks the CLI again.
+   *
+   * The Settings model list's refresh is the only caller: it may have just
+   * installed the SDK or changed plan, and the five-minute failure cooldown
+   * would otherwise keep answering "no fast models" from stale facts.
+   */
+  invalidateFast(): void {
+    this.fastCapability = undefined
+    this.fastCapabilityRetryAt = 0
   }
 
   /**
