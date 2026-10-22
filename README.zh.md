@@ -185,6 +185,32 @@ Codex 模型还可填写上下文 token 数，留空跟随服务商。插件读�
 
 原有推理档配置继续从 `~/.dsh/plugins/subscriptions/model-defaults.json`（权限 0600）读取并保存。若保存中途失败，界面会保留未完成的草稿，明确提示已经保存的推理档，并可重试完成。
 
+### Claude 传输方式（`claudeTransport`）
+
+Claude 订阅路由默认通过官方 `@anthropic-ai/claude-agent-sdk` 推理。订阅型 OAuth token 只允许官方客户端
+使用,所以插件不再自己冒充 Claude Code CLI 直连 Messages API:它用存好的 token 跑 SDK 自带的 CLI,
+通过本机 MCP 桥把 harness 的工具交给它,并把 harness 自己执行出来的真实结果回灌给它。一次 `stream()`
+恰好是一次模型往返,工具执行、权限与会话日志仍然归 harness。
+
+```yaml
+    claudeTransport: agent-sdk        # 默认,合规路径
+    claudeSdkEntry: /path/to/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs
+    claudeIdleCloseMs: 600000         # 空闲 CLI 进程保留多久后回收
+    claudeFastMode: auto              # auto 沿用 Claude Code 自身设置;on/off 强制
+```
+
+SDK 是可选运行时依赖:依次查 `claudeSdkEntry`、`DSH_CLAUDE_AGENT_SDK`、本 profile、`~/.dsh/profiles`
+下的其他 profile。找不到安装时该路由**拒绝提供服务**,不会退回直连传输——请安装
+`@anthropic-ai/claude-agent-sdk`、指定 `claudeSdkEntry`,或把 `claudeTransport` 设为 `'api'`
+显式退回直连(该路径不符合订阅条款)。
+
+SDK 进程是隔离的:`settingSources: []`(不读 CLAUDE.md、hooks、skills、plugins、MCP 配置)、`tools: []`、
+`strictMcpConfig`、`persistSession: false`,以及 `~/.dsh/plugins/subscriptions/claude-sdk/` 下独立的
+`CLAUDE_CONFIG_DIR` 和 `DISABLE_AUTOUPDATER=1`。不会写你自己的 `~/.claude`,`projects/` 里不会有会话
+记录(所以 `claude --resume` 和 Claude Code 面板都不会列出这些会话),CLI 也不落盘凭据,存的 refresh
+token 不受影响。原有的 provider 旋钮含义不变:提示缓存时长、输出上限、推理强度(会话中通过控制请求热切换)、
+思考预算与显示、模型切换、插件代理配置、fast 模式。
+
 ## 配置
 
 ```yaml

@@ -186,6 +186,39 @@ Default reasoning effort now lives in **Edit model list**, beside each model's v
 
 Existing defaults continue to load from and save to `~/.dsh/plugins/subscriptions/model-defaults.json` (mode 0600). If a save fails partway through, unfinished edits remain in the draft; the UI reports any defaults already saved and lets you retry.
 
+### Claude transport (`claudeTransport`)
+
+By default the Claude subscription route performs inference through the official
+`@anthropic-ai/claude-agent-sdk`. A subscription OAuth token may only be spent by the official
+client, so the plugin no longer posts to the Messages API itself while presenting as the Claude
+Code CLI: it runs the SDK's bundled CLI with the stored token, hands it the harness's tools over a
+local MCP bridge, and returns the harness's own tool results back to it. One `stream()` call is
+exactly one model round trip, so the harness keeps ownership of tool execution, permissions and its
+session log.
+
+```yaml
+    claudeTransport: agent-sdk        # default; the compliant path
+    claudeSdkEntry: /path/to/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs
+    claudeIdleCloseMs: 600000         # keep an idle CLI process this long before dropping it
+    claudeFastMode: auto              # auto = Claude Code's own setting; on/off force it
+```
+
+The SDK is an optional runtime dependency: `claudeSdkEntry`, then `DSH_CLAUDE_AGENT_SDK`, then this
+profile, then any other profile under `~/.dsh/profiles` is searched. When no installation is found
+the route **refuses turns** instead of falling back to the direct transport — install
+`@anthropic-ai/claude-agent-sdk`, point `claudeSdkEntry` at one, or set
+`claudeTransport: 'api'` to opt back in to the direct Messages API call, which does not comply with
+the subscription terms.
+
+The SDK process is isolated: `settingSources: []` (no CLAUDE.md, hooks, skills, plugins or MCP
+config), `tools: []`, `strictMcpConfig`, `persistSession: false`, and a private `CLAUDE_CONFIG_DIR`
+under `~/.dsh/plugins/subscriptions/claude-sdk/` with `DISABLE_AUTOUPDATER=1`. Nothing is written to
+your own `~/.claude`, no transcript lands in `projects/` (so `claude --resume` and the Claude Code
+panel never list these sessions), and the CLI never persists credentials, so the stored refresh
+token is untouched. Provider controls keep their meaning: prompt-cache TTL, output cap, reasoning
+effort (rethuned live through control requests), thinking budget and display, model switching, the
+plugin proxy config, and fast mode.
+
 ## Config
 
 ```yaml
