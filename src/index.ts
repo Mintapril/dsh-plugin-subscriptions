@@ -862,9 +862,12 @@ export function apply(ctx: Context, config: Config): void {
   /**
    * Build the compliant claude transport, or the refusing stand-in when no SDK
    * installation can be found.
+   * @param accessToken - reads the subscription token the one-time
+   *   fast-capability probe spends. Without it the probe cannot even start, so
+   *   the Speed control never learns that a Claude model is fast-capable.
    * @returns the transport seam handed to the claude adapter.
    */
-  const resolveAgentSdkTransport = (): ClaudeSdkRouteStream => {
+  const resolveAgentSdkTransport = (accessToken: (force: boolean) => Promise<string>): ClaudeSdkRouteStream => {
     const entry = resolveClaudeSdkEntry(claudeSdkEntry)
     if (entry === undefined) {
       onWarn(
@@ -886,6 +889,7 @@ export function apply(ctx: Context, config: Config): void {
       idleCloseMs: claudeIdleCloseMs,
       fastMode: claudeFastMode,
       proxyPath: dshHomePath('plugins', 'subscriptions', 'proxy.json'),
+      accessToken,
       onWarn,
       onLog: (message, detail) => {
         ctx.logger.debug(`dsh-plugin-subscriptions: ${message}`, detail)
@@ -972,7 +976,10 @@ export function apply(ctx: Context, config: Config): void {
         // The Agent SDK transport is built before the adapter so a missing
         // installation is reported once at startup, and the route refuses turns
         // instead of quietly reverting to the non-compliant direct transport.
-        const claudeAgentSdk = claudeTransport === 'agent-sdk' ? resolveAgentSdkTransport() : undefined
+        // The default account's token also powers the fast-capability probe.
+        const claudeAgentSdk = claudeTransport === 'agent-sdk'
+          ? resolveAgentSdkTransport(async force => (await tokens.session(undefined, force)).accessToken)
+          : undefined
         if (claudeAgentSdk !== undefined) {
           ctx.effect(() => () => { void claudeAgentSdk.close() }, 'dsh-plugin-subscriptions: claude agent sdk transport')
         }

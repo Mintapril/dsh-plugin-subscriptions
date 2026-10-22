@@ -250,6 +250,36 @@ export function claudeSdkUnavailable(reason: string): ClaudeSdkRouteStream {
   }
 }
 
+/** Longest the one-time fast-capability probe may take before it answers nothing. */
+const FAST_PROBE_TIMEOUT_MS = 20_000
+
+/**
+ * Bound the probe's control request.
+ *
+ * The Speed toggle reads the capability table when the composer mounts, so an
+ * unbounded await would leave the control missing until the host restarts. A
+ * timed-out probe answers as a failure instead, which the table already turns
+ * into a retry after the cooldown.
+ * @param work - the SDK's model-table request.
+ * @returns the rows, or the promise rejects when the CLI did not answer in time.
+ */
+async function withFastProbeTimeout(work: Promise<readonly SdkModelRow[]>): Promise<readonly SdkModelRow[]> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      work,
+      new Promise<readonly SdkModelRow[]>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error('the CLI did not answer the model-table request'))
+        }, FAST_PROBE_TIMEOUT_MS)
+        timer.unref()
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /** One capability answer carrying no fast models (probe skipped or failed). */
 const EMPTY_FAST_TABLE: { exact: Set<string>; aliases: Set<string> } = { exact: new Set(), aliases: new Set() }
 
@@ -1912,10 +1942,11 @@ export class ClaudeSdkTransport implements ClaudeSdkRouteStream {
     const input = new UserInputQueue()
     const query = sdk.query({ prompt: input, options: this.capabilityOptions(token) })
     try {
-      // The CLI spawns on the first read and answers with system/init; the
-      // control request below needs that session live.
-      await Promise.race([query.next(), new Promise(resolve => setTimeout(resolve, 20_000).unref())])
-      const rows = await query.supportedModels?.() ?? []
+      // `supportedModels()` starts the CLI and answers on its own (~1.6s cold
+      // here). Reading the prompt first does NOT help: `next()` only resolves
+      // once a real message arrives, so waiting for it burned the whole 20s
+      // timeout and made the first Speed read take that long.
+      const rows = await withFastProbeTimeout(query.supportedModels?.() ?? Promise.resolve([]))
       const exact = new Set<string>()
       const aliases = new Set<string>()
       for (const row of rows) {

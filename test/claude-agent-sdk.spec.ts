@@ -242,7 +242,9 @@ test('fast capability: a user-driven refresh re-probes instead of trusting the c
     'export function query() {',
     '  globalThis.__dshFastProbes = (globalThis.__dshFastProbes ?? 0) + 1',
     '  return {',
-    "    next: async () => ({ done: false, value: { type: 'system', subtype: 'init' } }),",
+    // A real query does not resolve next() before a message exists (measured:
+    // it never does for this throwaway process), so the probe must not wait on it.
+    "    next: () => new Promise(() => {}),",
     '    supportedModels: async () => JSON.parse(readFileSync(process.env.DSH_FAST_FIXTURE, "utf8")),',
     '    close: () => {},',
     '  }',
@@ -255,7 +257,11 @@ test('fast capability: a user-driven refresh re-probes instead of trusting the c
   const sdk = transport({ sdkEntry: entry, accessToken: async () => 'token', onWarn: () => {} })
   try {
     writeFileSync(fixture, JSON.stringify([{ value: 'opus', supportsFastMode: true }]))
+    // The table arrives without waiting for a prompt message: waiting for one
+    // made the composer's first Speed read take the whole probe timeout.
+    const started = Date.now()
     assert.equal(await sdk.supportsFast('claude-opus-5-5'), true)
+    assert.ok(Date.now() - started < 5_000, `the probe answered in ${Date.now() - started}ms`)
     // The CLI's answer changes (a new SDK, a different plan): the cached table
     // still answers, which is exactly why the refresh has to drop it.
     writeFileSync(fixture, JSON.stringify([{ value: 'opus', supportsFastMode: false }]))
